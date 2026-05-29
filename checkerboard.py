@@ -36,13 +36,14 @@ class ProblemInstance:
         if np.any(np.triu(J, k=1) != J):
             raise ValueError('J must be upper-triangular with 0s along the diagonal')
 
-        self.J = J
-        self.h = h
+        self.J = np.asarray(J, dtype=float)
+        self.h = np.asarray(h, dtype=float)
         self.T = T 
-        self.n = h.size
+        self.n = self.h.size
         
         # Scale for quantum Hamiltonian (Prevents variance from blowing up or shrinking)
-        scale = ( self.n / (la.norm(J, ord='fro')**2 + la.norm(h, ord=2)**2) )**0.5
+        scale_denominator = la.norm(self.J, ord='fro')**2 + la.norm(self.h, ord=2)**2
+        scale = 1.0 if scale_denominator == 0 else ( self.n / scale_denominator )**0.5
         self.J_quantum = self.J * scale 
         self.h_quantum = self.h * scale
 
@@ -50,14 +51,16 @@ class ProblemInstance:
             self.E_arr = np.zeros((2**self.n))
             for i in range(2**self.n):
                 config = int2spinconf(i, self.n)
-                self.E_arr[i] = config @ J @ config + config @ h 
+                self.E_arr[i] = config @ self.J @ config + config @ self.h 
 
 def RandomProblemInstance(n, connectivity, T=None, precomp_E=True):
     h = np.random.randn(n)
     if connectivity=='line':
         J = np.diag(np.random.randn(n-1), k=1)
-    if connectivity=='full':
+    elif connectivity=='full':
         J = np.triu(np.random.randn(n,n), k=1)
+    else:
+        raise ValueError("connectivity must be either 'line' or 'full'")
     return ProblemInstance(J, h, T=T, precomp_E=precomp_E)
 
 def my_kron(arr_list):
@@ -101,6 +104,21 @@ def local_proposal_mat(n):
 def uniform_proposal_mat(n):
     return np.ones((2**n, 2**n))/2**n
 
+def clean_column_stochastic_matrix(matrix, tol=1e-12):
+    """
+    Removes tiny numerical artifacts from a column-stochastic matrix and
+    renormalizes columns. Raises if the matrix contains meaningful negatives.
+    """
+    matrix = np.real_if_close(matrix).astype(float)
+    matrix[np.abs(matrix) < tol] = 0.0
+    if np.any(matrix < -tol):
+        raise ValueError('Matrix contains negative probabilities beyond numerical tolerance.')
+    matrix = np.maximum(matrix, 0.0)
+    col_sums = matrix.sum(axis=0)
+    if np.any(col_sums <= 0):
+        raise ValueError('Matrix contains a zero-probability column.')
+    return matrix / col_sums
+
 def quantum_proposal_mat_ideal(problem_inst):
     def cont_eig(Dlambda):
         t_0, t_f = 2, 20
@@ -134,41 +152,47 @@ def quantum_proposal_mat_ideal(problem_inst):
         prop_list[c_ind] = M.T * cont_eig(vals_diff) @ M 
     
     proposal_mat = sum(prop_list)/len(c_mids)
-    return proposal_mat
+    return clean_column_stochastic_matrix(proposal_mat)
 
 def make_transition_mat(problem_inst, proposal_mat, acceptance='metropolis'):
     if problem_inst.T is None: raise TypeError('Temperature T is undefined.')
     if problem_inst.T < 0: raise ValueError('Temperature T cannot be negative.')
+    if not hasattr(problem_inst, 'E_arr'):
+        raise TypeError('ProblemInstance must have precomputed E_arr to build a dense transition matrix.')
 
     n = problem_inst.n
     T = problem_inst.T
     E_rowstack = np.tile(problem_inst.E_arr, (2**n,1))
     E_diff = E_rowstack.T - E_rowstack
 
-    uphill_moves = (E_diff >= 0) 
-    downhill_moves = np.invert(uphill_moves)
+    uphill_or_level_moves = (E_diff >= 0)
+    uphill_moves = (E_diff > 0)
+    downhill_moves = (E_diff < 0)
+    level_moves = (E_diff == 0)
 
     if acceptance=='metropolis':
         if T>0:
-            pi_ratio = np.exp(-E_diff/T, where=uphill_moves, out=np.ones_like(E_diff)) 
+            pi_ratio = np.exp(-E_diff/T, where=uphill_moves, out=np.ones_like(E_diff))
         if T==0:
             pi_ratio = np.where(uphill_moves, 0., 1.)
         A = pi_ratio
 
-    if acceptance=='glauber':
+    elif acceptance=='glauber':
         if T>0:
-            pi_ratio = np.exp(-E_diff/T, where=uphill_moves, out=E_diff*np.nan) 
+            pi_ratio = np.exp(-E_diff/T, where=uphill_or_level_moves, out=E_diff*np.nan) 
             pi_ratio_inv = np.exp(E_diff/T, where=downhill_moves, out=E_diff*np.nan)
         if T==0:
-            pi_ratio = np.where(uphill_moves, 0., 1.)
-            pi_ratio_inv = np.where(downhill_moves, 0., 1.)
-        A = np.where(uphill_moves, pi_ratio/(1+pi_ratio), (1+pi_ratio_inv)**(-1) )
+            A = np.where(uphill_moves, 0., np.where(level_moves, 0.5, 1.))
+        else:
+            A = np.where(uphill_or_level_moves, pi_ratio/(1+pi_ratio), (1+pi_ratio_inv)**(-1) )
+    else:
+        raise ValueError("acceptance must be either 'metropolis' or 'glauber'")
 
     P = A * proposal_mat
     np.fill_diagonal(P, 0)
     diag = np.ones(2**n) - np.sum(P, axis=0)
     P = P + np.diag(diag)
-    return P
+    return clean_column_stochastic_matrix(P)
 
 def abs_spectral_gap(transition_mat):
     dist = np.sort( 1-np.abs(la.eigvals(transition_mat)) )
@@ -178,62 +202,92 @@ def abs_spectral_gap(transition_mat):
     return delta, delta_lazy
 
 def generate_move(transition_mat, state):
-    return np.random.choice(transition_mat.shape[0], p=transition_mat[:,state])
+    probabilities = np.real_if_close(transition_mat[:, state]).astype(float)
+    probabilities = np.where(np.abs(probabilities) < 1e-14, 0.0, probabilities)
+    if np.any(probabilities < 0):
+        raise ValueError('Transition matrix column contains negative probabilities.')
+    total = probabilities.sum()
+    if total <= 0:
+        raise ValueError('Transition matrix column has zero total probability.')
+    return np.random.choice(transition_mat.shape[0], p=probabilities/total)
 
 # =============================================================================
 # NEW PARALLEL CHECKERBOARD ARCHITECTURE
 # =============================================================================
 
-def get_effective_problem(problem_inst, active_indices, full_state_config):
+class _ProblemView:
+    """Lightweight view of a global problem that avoids copying J into J_quantum in workers."""
+    def __init__(self, J, h, T):
+        self.J = J
+        self.h = h
+        self.T = T
+        self.n = h.size
+
+
+def ising_energy(problem_inst, config):
+    """Energy convention used by this file: E(s) = s.T J s + s.T h."""
+    config = np.asarray(config, dtype=float)
+    return config @ problem_inst.J @ config + config @ problem_inst.h
+
+
+def _validate_spin_config(config, expected_size):
+    config = np.asarray(config)
+    if config.shape != (expected_size,):
+        raise ValueError(f'Expected a spin configuration of shape ({expected_size},).')
+    if np.any((config != -1) & (config != 1)):
+        raise ValueError('Spin configuration entries must all be -1 or +1.')
+
+
+def _validate_checkerboard_partition(black_blocks, white_blocks, n):
+    blocks = list(black_blocks) + list(white_blocks)
+    if len(blocks) == 0:
+        raise ValueError('At least one checkerboard block is required.')
+    flat = np.concatenate([np.asarray(block, dtype=int) for block in blocks])
+    if flat.size != n:
+        raise ValueError('Checkerboard blocks must cover every spin exactly once.')
+    if np.any(flat < 0) or np.any(flat >= n):
+        raise ValueError('Checkerboard blocks contain out-of-range spin indices.')
+    if np.unique(flat).size != n:
+        raise ValueError('Checkerboard blocks contain duplicate spin indices.')
+
+
+def get_effective_problem(problem_inst, active_indices, full_state_config, precomp_E=None):
     r"""
-    Creates an effective ProblemInstance representing a localized subsystem (e.g., a 
-    checkerboard block). The unselected boundary spins are frozen and mathematically 
-    factored into an external field applied to the active spins. This allows us to 
-    simulate the sub-block dynamically without breaking detailed balance.
+    Creates the improved-local-group problem for one checkerboard block.
+
+    The inactive spins are frozen and folded into the block field, so energy
+    differences inside the block exactly match global energy differences with
+    the boundary held fixed:
     
-    Implements Equation 14: \tilde{h}_j = h_j + \sum_{i \notin g_l} J_{ji} s_i
+        h_eff[j] = h[j] + sum_{i not in block} J_sym[j, i] s[i]
+
+    This is the coarse-grained strategy from Ferguson and Wallden, adapted to
+    this file's sign convention E(s) = s.T J s + s.T h.
     """
-    # Ensure indices are sorted to maintain proper matrix alignment
-    active_indices = np.sort(active_indices)
-    
-    # -------------------------------------------------------------------------
-    # 1. Isolate the Inactive (Boundary) Environment
-    # -------------------------------------------------------------------------
-    # Create a boolean mask where True indicates an active spin inside the block
+    active_indices = np.sort(np.asarray(active_indices, dtype=int))
+    if active_indices.size == 0:
+        raise ValueError('A checkerboard block cannot be empty.')
+    if np.any(active_indices < 0) or np.any(active_indices >= problem_inst.n):
+        raise ValueError('A checkerboard block contains an out-of-range spin index.')
+    if np.unique(active_indices).size != active_indices.size:
+        raise ValueError('A checkerboard block contains duplicate spin indices.')
+
+    _validate_spin_config(full_state_config, problem_inst.n)
+    full_state_config = np.asarray(full_state_config, dtype=float)
+
     active_mask = np.zeros(problem_inst.n, dtype=bool)
     active_mask[active_indices] = True
-    
-    # Extract the full configuration and zero out the active spins. 
-    # This leaves only the fixed environmental boundary spins.
+
     inactive_config = full_state_config.copy()
     inactive_config[active_mask] = 0.0 
-    
-    # -------------------------------------------------------------------------
-    # 2. Compute the Effective Field Term (\tilde{h}_j)
-    # -------------------------------------------------------------------------
-    # The interaction between the active block and the frozen boundary acts as 
-    # a local magnetic field. Since J is upper triangular, (J + J.T) gives the 
-    # full symmetric coupling matrix. Multiplying by the inactive configuration 
-    # perfectly calculates \sum_{i \notin g_l} J_{ji} s_i for all spins.
+
     h_interaction = (problem_inst.J + problem_inst.J.T) @ inactive_config
-    
-    # Add the base field h_j to the boundary interaction field
     h_eff = problem_inst.h[active_indices] + h_interaction[active_indices]
-    
-    # -------------------------------------------------------------------------
-    # 3. Preserve Internal Entanglement Couplings (J_eff)
-    # -------------------------------------------------------------------------
-    # Extract the sub-matrix of J containing only connections *within* the block
     J_eff = problem_inst.J[np.ix_(active_indices, active_indices)]
-    
-    # -------------------------------------------------------------------------
-    # 4. Construct the Localized Problem Instance
-    # -------------------------------------------------------------------------
-    # WARNING: Precomputing E_arr constructs a 2^n length array. 
-    # For a 10x10 block, 2^100 states would immediately cause an Out-Of-Memory crash.
-    # Therefore, we only precompute energies if the block is small enough (n <= 12).
-    precomp = len(active_indices) <= 12
-    return ProblemInstance(J_eff, h_eff, T=problem_inst.T, precomp_E=precomp)
+
+    if precomp_E is None:
+        precomp_E = len(active_indices) <= 12
+    return ProblemInstance(J_eff, h_eff, T=problem_inst.T, precomp_E=precomp_E)
 
 def build_2d_lattice(L):
     """
@@ -272,6 +326,11 @@ def get_checkerboard_blocks(L, B):
     Returns black_blocks, white_blocks (lists of active_indices arrays).
     This strictly bipartite geometry ensures conditional independence during parallel updates.
     """
+    if L <= 0 or B <= 0:
+        raise ValueError('L and B must be positive integers.')
+    if L % B != 0:
+        raise ValueError('B must divide L exactly; otherwise some spins would be dropped.')
+
     black_blocks = []
     white_blocks = []
     
@@ -302,6 +361,12 @@ def dynamic_local_mcmc(problem_inst, current_block_config, num_moves=100):
     matrix, making it safe and efficient for classically simulating large blocks 
     (e.g., n=100) where exact diagonalization would cause an OOM crash.
     """
+    if problem_inst.T is None:
+        raise TypeError('Temperature T is undefined.')
+    if problem_inst.T < 0:
+        raise ValueError('Temperature T cannot be negative.')
+    _validate_spin_config(current_block_config, problem_inst.n)
+
     config = current_block_config.copy()
     n = problem_inst.n
     
@@ -326,76 +391,162 @@ def dynamic_local_mcmc(problem_inst, current_block_config, num_moves=100):
             
     return config
 
+
+def _update_block_worker(args):
     """
-    Worker function for multiprocessing. 
-    Evaluates a single block independently conditionally on its frozen boundary fields. 
-    If the block is small enough, it uses the exact theoretical quantum proposal matrix. 
-    For large blocks, it gracefully falls back to classical dynamic MCMC to avoid 
-    memory crashes.
+    Multiprocessing worker for one improved-local checkerboard group.
+
+    The worker freezes all spins outside block_indices, folds them into h_eff
+    using get_effective_problem, then applies either the ideal quantum proposal
+    for small blocks or a local-MCMC fallback for blocks too large to diagonalize.
     """
-    # Unpack the serialized arguments from the multiprocessing pool
-    block_indices, global_J, global_h, global_T, current_config, use_quantum = args
-    
-    # Reconstruct the global ProblemInstance (acting as a lightweight container)
-    prob_global = ProblemInstance(global_J, global_h, T=global_T, precomp_E=False)
-    
-    # Dynamically generate the localized Hamiltonian, folding the boundary spins 
-    # into the effective field term \tilde{h}_j
-    eff_prob = get_effective_problem(prob_global, block_indices, current_config)
-    
+    (
+        block_indices,
+        global_J,
+        global_h,
+        global_T,
+        frozen_config,
+        use_quantum,
+        acceptance,
+        max_quantum_block_size,
+        classical_sweeps_per_block,
+    ) = args
+
+    block_indices = np.sort(np.asarray(block_indices, dtype=int))
     n_block = len(block_indices)
-    current_block_config = current_config[block_indices]
-    
-    # -------------------------------------------------------------------------
-    # STATE TRANSITION LOGIC
-    # -------------------------------------------------------------------------
-    # For a 10x10 block, n=100. Generating the quantum proposal requires exact 
-    # diagonalization of a 2^100 x 2^100 matrix, which is physically impossible classically.
-    # Therefore, we branch logic based on the block size.
-    if use_quantum and n_block <= 12:
-        # EXACT QUANTUM PROPOSAL (Theoretical Hardware Simulation)
+    use_exact_quantum = use_quantum and n_block <= max_quantum_block_size
+
+    prob_global = _ProblemView(global_J, global_h, global_T)
+    eff_prob = get_effective_problem(
+        prob_global,
+        block_indices,
+        frozen_config,
+        precomp_E=use_exact_quantum,
+    )
+    current_block_config = np.asarray(frozen_config)[block_indices]
+
+    if use_exact_quantum:
         prop_mat = quantum_proposal_mat_ideal(eff_prob)
-        trans_mat = make_transition_mat(eff_prob, prop_mat, acceptance='metropolis')
-        
-        # Map boolean configuration to integer state, apply transition, and map back
+        trans_mat = make_transition_mat(eff_prob, prop_mat, acceptance=acceptance)
         current_block_int = spinconf2int(current_block_config)
         new_block_int = generate_move(trans_mat, current_block_int)
         new_block_config = int2spinconf(new_block_int, n_block)
     else:
-        # CLASSICAL FALLBACK (For large blocks / classical sanity testing)
-        new_block_config = dynamic_local_mcmc(eff_prob, current_block_config, num_moves=n_block)
-        
-    # Return the block indices alongside the new state so the master process can re-sync
+        num_moves = max(1, int(np.ceil(classical_sweeps_per_block * n_block)))
+        new_block_config = dynamic_local_mcmc(eff_prob, current_block_config, num_moves=num_moves)
+
     return block_indices, new_block_config
 
-def parallel_checkerboard_update(problem_inst, current_config, black_blocks, white_blocks, pool, use_quantum=False):
+def parallel_checkerboard_update(
+    problem_inst,
+    current_config,
+    black_blocks,
+    white_blocks,
+    pool,
+    use_quantum=False,
+    acceptance='metropolis',
+    max_quantum_block_size=12,
+    classical_sweeps_per_block=1,
+):
     """
     Performs one full parallel sweep of the checkerboard lattice.
     Updates all Black blocks simultaneously (conditionally on the static White blocks), 
     synchronizes the global state, and then updates all White blocks.
+
+    This is a block MCMC kernel: each block uses the improved local group
+    Hamiltonian induced by the frozen spins outside that block. Same-color
+    blocks may be dispatched in parallel when they do not directly interact,
+    which is true for build_2d_lattice nearest-neighbor checkerboards.
     """
-    # -------------------------------------------------------------------------
-    # PHASE 1: BLACK BLOCKS
-    # -------------------------------------------------------------------------
-    # Serialize arguments and dispatch all black blocks to the CPU pool
-    args_black = [(block, problem_inst.J, problem_inst.h, problem_inst.T, current_config, use_quantum) for block in black_blocks]
+    if problem_inst.T is None:
+        raise TypeError('Temperature T is undefined.')
+    if max_quantum_block_size < 1:
+        raise ValueError('max_quantum_block_size must be at least 1.')
+    if classical_sweeps_per_block <= 0:
+        raise ValueError('classical_sweeps_per_block must be positive.')
+    _validate_spin_config(current_config, problem_inst.n)
+    _validate_checkerboard_partition(black_blocks, white_blocks, problem_inst.n)
+
+    current_config = np.asarray(current_config).copy()
+
+    black_reference = current_config.copy()
+    args_black = [
+        (
+            block,
+            problem_inst.J,
+            problem_inst.h,
+            problem_inst.T,
+            black_reference,
+            use_quantum,
+            acceptance,
+            max_quantum_block_size,
+            classical_sweeps_per_block,
+        )
+        for block in black_blocks
+    ]
     results_black = pool.map(_update_block_worker, args_black)
-    
-    # Barrier synchronization: Wait for all Black blocks to finish, then merge their 
-    # new states into the global configuration
+
     for block_indices, new_block_config in results_black:
         current_config[block_indices] = new_block_config
-        
-    # -------------------------------------------------------------------------
-    # PHASE 2: WHITE BLOCKS
-    # -------------------------------------------------------------------------
-    # Now that the Black blocks have updated, dispatch all White blocks. 
-    # They will calculate their new boundary fields based on the updated Black spins.
-    args_white = [(block, problem_inst.J, problem_inst.h, problem_inst.T, current_config, use_quantum) for block in white_blocks]
+
+    white_reference = current_config.copy()
+    args_white = [
+        (
+            block,
+            problem_inst.J,
+            problem_inst.h,
+            problem_inst.T,
+            white_reference,
+            use_quantum,
+            acceptance,
+            max_quantum_block_size,
+            classical_sweeps_per_block,
+        )
+        for block in white_blocks
+    ]
     results_white = pool.map(_update_block_worker, args_white)
-    
-    # Barrier synchronization: Merge White blocks into the global configuration
+
     for block_indices, new_block_config in results_white:
         current_config[block_indices] = new_block_config
         
     return current_config
+
+if __name__ == '__main__':
+    # =============================================================================
+    # EXAMPLE USAGE: Coarse-grained checkerboard QeMCMC
+    # =============================================================================
+    
+    L = 20       # Lattice dimension (20x20 = 400 total spins)
+    B = 2        # Block dimension (2x2 = 4 spins per quantum group)
+    T = 1.0
+    num_sweeps = 5
+    max_quantum_block_size = 12
+    
+    print(f"Initializing {L}x{L} Lattice with {B}x{B} Checkerboard Blocks...")
+    global_problem = build_2d_lattice(L)
+    global_problem.T = T
+    
+    black_blocks, white_blocks = get_checkerboard_blocks(L, B)
+    print(f"Created {len(black_blocks)} Black Blocks and {len(white_blocks)} White Blocks.")
+    
+    # Initialize random starting state
+    current_state_config = np.random.choice([-1, 1], size=L*L)
+    
+    print("\nStarting Parallel Checkerboard MCMC Sweeps...")
+    start_time = time.time()
+    
+    with multiprocessing.Pool() as pool:
+        for sweep in range(num_sweeps):
+            sweep_start = time.time()
+            current_state_config = parallel_checkerboard_update(
+                global_problem, 
+                current_state_config, 
+                black_blocks, 
+                white_blocks, 
+                pool,
+                use_quantum=True,
+                max_quantum_block_size=max_quantum_block_size,
+            )
+            print(f"  Completed Sweep {sweep + 1}/{num_sweeps} ({(time.time() - sweep_start):.2f}s)")
+            
+    print(f"\nSimulation Complete in {time.time() - start_time:.2f}s!")
