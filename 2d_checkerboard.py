@@ -1,22 +1,3 @@
-# the code in this document uses code from Laydens original QeMCMC algorithm
-# the actual quantum proposal model is orchestrated to run in 
-# a parallel checkerboard decomposition on the EA model
-# the paper treats the constant spins surrounding each block as 
-# constants which are factored into the hamiltonian through the 
-# external field term. the reacceptance logic is independant for 
-# each block as they do not interact. testing has not yet been 
-# carried out to see how the advantage manifests in this formulation.
-# it has been thoeretically shown to follow all of the rules of mcmc. 
-
-# only the functions are provided here, not the actual code to run it
-# although the code to do is quite straighforward and has effectively been done. 
-
-# the code in this was created in part with ai
-# the exact mathematical formulation was provided, including the mathematical proof  
-# of efficacy. the relevant quantum proposal functions Laydens group used were 
-# also provided. ai was then told to just execute on all of the math it already had.
-# classical parallel checkerboard domain decomposition was also given. 
-
 import numpy as np
 import scipy.linalg as la
 from itertools import product
@@ -33,11 +14,17 @@ class ProblemInstance:
     n-dimensional local field vector h, and a non-negative temperature T.
     """
     def __init__(self, J, h, T=None, precomp_E = True):
+        J = np.asarray(J, dtype=float)
+        h = np.asarray(h, dtype=float)
+        if h.ndim != 1:
+            raise ValueError('h must be a one-dimensional array.')
+        if J.shape != (h.size, h.size):
+            raise ValueError('J must be a square matrix with dimensions matching h.')
         if np.any(np.triu(J, k=1) != J):
             raise ValueError('J must be upper-triangular with 0s along the diagonal')
 
-        self.J = np.asarray(J, dtype=float)
-        self.h = np.asarray(h, dtype=float)
+        self.J = J
+        self.h = h
         self.T = T 
         self.n = self.h.size
         
@@ -119,6 +106,53 @@ def clean_column_stochastic_matrix(matrix, tol=1e-12):
         raise ValueError('Matrix contains a zero-probability column.')
     return matrix / col_sums
 
+
+def clean_symmetric_stochastic_matrix(matrix, tol=1e-10):
+    """
+    Cleans an ideal quantum proposal matrix while preserving the two properties
+    needed by the Layden Metropolis simplification: symmetry and stochasticity.
+    This function checks the quantum walker; it does not reshape a bad proposal
+    into a different Markov kernel.
+    """
+    matrix = np.real_if_close(matrix).astype(float)
+    matrix = (matrix + matrix.T)/2
+    matrix[np.abs(matrix) < tol] = 0.0
+    if np.any(matrix < -tol):
+        raise ValueError('Quantum proposal contains negative probabilities beyond numerical tolerance.')
+    matrix = np.maximum(matrix, 0.0)
+
+    col_sums = matrix.sum(axis=0)
+    if np.any(col_sums <= 0):
+        raise ValueError('Quantum proposal contains a zero-probability column.')
+    col_err = np.max(np.abs(matrix.sum(axis=0) - 1))
+    sym_err = np.max(np.abs(matrix - matrix.T))
+    if col_err > tol or sym_err > tol:
+        raise ValueError('Quantum proposal is not symmetric and stochastic within tolerance.')
+    return matrix
+
+
+def clean_transition_matrix(matrix, tol=1e-12):
+    """
+    Removes tiny numerical artifacts from a transition matrix while preserving
+    off-diagonal Metropolis probabilities. Any column-sum residual is assigned
+    to the self-transition probability.
+    """
+    matrix = np.real_if_close(matrix).astype(float)
+    matrix[np.abs(matrix) < tol] = 0.0
+    if np.any(matrix < -tol):
+        raise ValueError('Transition matrix contains negative probabilities beyond numerical tolerance.')
+    matrix = np.maximum(matrix, 0.0)
+    residual = 1.0 - matrix.sum(axis=0)
+    matrix = matrix + np.diag(residual)
+    if np.any(np.diag(matrix) < -tol):
+        raise ValueError('Transition matrix has invalid self-transition probabilities.')
+    matrix[np.abs(matrix) < tol] = 0.0
+    col_err = np.max(np.abs(matrix.sum(axis=0) - 1))
+    if col_err > tol:
+        raise ValueError('Transition matrix is not column-stochastic within tolerance.')
+    return matrix
+
+
 def quantum_proposal_mat_ideal(problem_inst):
     def cont_eig(Dlambda):
         t_0, t_f = 2, 20
@@ -152,7 +186,7 @@ def quantum_proposal_mat_ideal(problem_inst):
         prop_list[c_ind] = M.T * cont_eig(vals_diff) @ M 
     
     proposal_mat = sum(prop_list)/len(c_mids)
-    return clean_column_stochastic_matrix(proposal_mat)
+    return clean_symmetric_stochastic_matrix(proposal_mat)
 
 def make_transition_mat(problem_inst, proposal_mat, acceptance='metropolis'):
     if problem_inst.T is None: raise TypeError('Temperature T is undefined.')
@@ -192,7 +226,7 @@ def make_transition_mat(problem_inst, proposal_mat, acceptance='metropolis'):
     np.fill_diagonal(P, 0)
     diag = np.ones(2**n) - np.sum(P, axis=0)
     P = P + np.diag(diag)
-    return clean_column_stochastic_matrix(P)
+    return clean_transition_matrix(P)
 
 def abs_spectral_gap(transition_mat):
     dist = np.sort( 1-np.abs(la.eigvals(transition_mat)) )
@@ -249,6 +283,23 @@ def _validate_checkerboard_partition(black_blocks, white_blocks, n):
         raise ValueError('Checkerboard blocks contain out-of-range spin indices.')
     if np.unique(flat).size != n:
         raise ValueError('Checkerboard blocks contain duplicate spin indices.')
+
+
+def _validate_parallel_block_independence(problem_inst, blocks, tol=1e-12):
+    """
+    Same-color blocks may be updated in parallel only when there are no couplings
+    between distinct blocks of that color.
+    """
+    coupling = np.abs(problem_inst.J + problem_inst.J.T)
+    for left_ind, left in enumerate(blocks):
+        left = np.asarray(left, dtype=int)
+        for right in blocks[left_ind + 1:]:
+            right = np.asarray(right, dtype=int)
+            if np.any(coupling[np.ix_(left, right)] > tol):
+                raise ValueError(
+                    'Same-color checkerboard blocks are coupled; parallel block updates '
+                    'would not be conditionally independent for this problem.'
+                )
 
 
 def get_effective_problem(problem_inst, active_indices, full_state_config, precomp_E=None):
@@ -354,7 +405,7 @@ def get_checkerboard_blocks(L, B):
                 
     return black_blocks, white_blocks
 
-def dynamic_local_mcmc(problem_inst, current_block_config, num_moves=100):
+def dynamic_local_mcmc(problem_inst, current_block_config, num_moves=100, acceptance='metropolis'):
     """
     Performs standard local Metropolis MCMC on a ProblemInstance. 
     Unlike make_transition_mat, this does not build a dense 2^n * 2^n transition 
@@ -383,10 +434,26 @@ def dynamic_local_mcmc(problem_inst, current_block_config, num_moves=100):
         # \Delta E = -2 * s_i * ( \sum_j J_{ij} s_j + h_i )
         dE = -2 * config[i] * (np.dot(J_sym[i, :], config) + h[i])
         
-        # Metropolis Acceptance Criterion:
-        # Always accept downhill moves (dE <= 0).
-        # Accept uphill moves with probability exp(-\Delta E / T).
-        if dE <= 0 or (T > 0 and np.random.rand() < np.exp(-dE / T)):
+        if acceptance == 'metropolis':
+            if dE <= 0:
+                accept_prob = 1.0
+            elif T == 0:
+                accept_prob = 0.0
+            else:
+                accept_prob = np.exp(-dE / T)
+        elif acceptance == 'glauber':
+            if T == 0:
+                accept_prob = 0.0 if dE > 0 else (0.5 if dE == 0 else 1.0)
+            elif dE >= 0:
+                ratio = np.exp(-dE / T)
+                accept_prob = ratio/(1 + ratio)
+            else:
+                ratio_inv = np.exp(dE / T)
+                accept_prob = 1/(1 + ratio_inv)
+        else:
+            raise ValueError("acceptance must be either 'metropolis' or 'glauber'")
+
+        if np.random.rand() <= accept_prob:
             config[i] *= -1 # Execute the spin flip
             
     return config
@@ -397,8 +464,9 @@ def _update_block_worker(args):
     Multiprocessing worker for one improved-local checkerboard group.
 
     The worker freezes all spins outside block_indices, folds them into h_eff
-    using get_effective_problem, then applies either the ideal quantum proposal
-    for small blocks or a local-MCMC fallback for blocks too large to diagonalize.
+    using get_effective_problem, then applies the ideal Layden quantum walker.
+    A local-MCMC path exists only when the caller explicitly allows a classical
+    fallback for oversized exact-simulation blocks.
     """
     (
         block_indices,
@@ -410,11 +478,20 @@ def _update_block_worker(args):
         acceptance,
         max_quantum_block_size,
         classical_sweeps_per_block,
+        allow_classical_fallback,
     ) = args
 
     block_indices = np.sort(np.asarray(block_indices, dtype=int))
     n_block = len(block_indices)
+    if not use_quantum and not allow_classical_fallback:
+        raise ValueError('Checkerboard QeMCMC requires use_quantum=True unless a classical fallback is explicitly allowed.')
     use_exact_quantum = use_quantum and n_block <= max_quantum_block_size
+    if use_quantum and not use_exact_quantum and not allow_classical_fallback:
+        raise ValueError(
+            f'Quantum checkerboard block has {n_block} spins, which exceeds '
+            f'max_quantum_block_size={max_quantum_block_size}. Increase the limit, '
+            'use smaller checkerboard blocks, or explicitly allow the classical fallback.'
+        )
 
     prob_global = _ProblemView(global_J, global_h, global_T)
     eff_prob = get_effective_problem(
@@ -433,7 +510,12 @@ def _update_block_worker(args):
         new_block_config = int2spinconf(new_block_int, n_block)
     else:
         num_moves = max(1, int(np.ceil(classical_sweeps_per_block * n_block)))
-        new_block_config = dynamic_local_mcmc(eff_prob, current_block_config, num_moves=num_moves)
+        new_block_config = dynamic_local_mcmc(
+            eff_prob,
+            current_block_config,
+            num_moves=num_moves,
+            acceptance=acceptance,
+        )
 
     return block_indices, new_block_config
 
@@ -443,10 +525,11 @@ def parallel_checkerboard_update(
     black_blocks,
     white_blocks,
     pool,
-    use_quantum=False,
+    use_quantum=True,
     acceptance='metropolis',
     max_quantum_block_size=12,
     classical_sweeps_per_block=1,
+    allow_classical_fallback=False,
 ):
     """
     Performs one full parallel sweep of the checkerboard lattice.
@@ -457,15 +540,23 @@ def parallel_checkerboard_update(
     Hamiltonian induced by the frozen spins outside that block. Same-color
     blocks may be dispatched in parallel when they do not directly interact,
     which is true for build_2d_lattice nearest-neighbor checkerboards.
+
+    By default this function requires the Layden quantum walker for every
+    block. Set allow_classical_fallback=True only for explicit debugging or
+    large-block classical sanity checks.
     """
     if problem_inst.T is None:
         raise TypeError('Temperature T is undefined.')
+    if not use_quantum and not allow_classical_fallback:
+        raise ValueError('Checkerboard QeMCMC requires use_quantum=True unless a classical fallback is explicitly allowed.')
     if max_quantum_block_size < 1:
         raise ValueError('max_quantum_block_size must be at least 1.')
     if classical_sweeps_per_block <= 0:
         raise ValueError('classical_sweeps_per_block must be positive.')
     _validate_spin_config(current_config, problem_inst.n)
     _validate_checkerboard_partition(black_blocks, white_blocks, problem_inst.n)
+    _validate_parallel_block_independence(problem_inst, black_blocks)
+    _validate_parallel_block_independence(problem_inst, white_blocks)
 
     current_config = np.asarray(current_config).copy()
 
@@ -481,6 +572,7 @@ def parallel_checkerboard_update(
             acceptance,
             max_quantum_block_size,
             classical_sweeps_per_block,
+            allow_classical_fallback,
         )
         for block in black_blocks
     ]
@@ -501,6 +593,7 @@ def parallel_checkerboard_update(
             acceptance,
             max_quantum_block_size,
             classical_sweeps_per_block,
+            allow_classical_fallback,
         )
         for block in white_blocks
     ]
@@ -510,43 +603,3 @@ def parallel_checkerboard_update(
         current_config[block_indices] = new_block_config
         
     return current_config
-
-if __name__ == '__main__':
-    # =============================================================================
-    # EXAMPLE USAGE: Coarse-grained checkerboard QeMCMC
-    # =============================================================================
-    
-    L = 20       # Lattice dimension (20x20 = 400 total spins)
-    B = 2        # Block dimension (2x2 = 4 spins per quantum group)
-    T = 1.0
-    num_sweeps = 5
-    max_quantum_block_size = 12
-    
-    print(f"Initializing {L}x{L} Lattice with {B}x{B} Checkerboard Blocks...")
-    global_problem = build_2d_lattice(L)
-    global_problem.T = T
-    
-    black_blocks, white_blocks = get_checkerboard_blocks(L, B)
-    print(f"Created {len(black_blocks)} Black Blocks and {len(white_blocks)} White Blocks.")
-    
-    # Initialize random starting state
-    current_state_config = np.random.choice([-1, 1], size=L*L)
-    
-    print("\nStarting Parallel Checkerboard MCMC Sweeps...")
-    start_time = time.time()
-    
-    with multiprocessing.Pool() as pool:
-        for sweep in range(num_sweeps):
-            sweep_start = time.time()
-            current_state_config = parallel_checkerboard_update(
-                global_problem, 
-                current_state_config, 
-                black_blocks, 
-                white_blocks, 
-                pool,
-                use_quantum=True,
-                max_quantum_block_size=max_quantum_block_size,
-            )
-            print(f"  Completed Sweep {sweep + 1}/{num_sweeps} ({(time.time() - sweep_start):.2f}s)")
-            
-    print(f"\nSimulation Complete in {time.time() - start_time:.2f}s!")
