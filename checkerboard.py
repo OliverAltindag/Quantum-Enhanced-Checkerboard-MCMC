@@ -1,8 +1,10 @@
-"""Trotterized checkerboard QeMCMC circuits with effective block fields.
+"""Untwirled checkerboard QeMCMC circuits with effective block fields.
 
-This file contains the Qiskit implementation of the research idea used in this
-project: apply Layden-style QeMCMC block proposals to a larger 2D Ising spin
-glass by checkerboard domain decomposition.
+This module implements the baseline, untwirled Qiskit version of a
+quantum-enhanced MCMC block proposal for larger 2D Ising spin
+glasses.  It combines checkerboard domain decomposition with frozen-boundary
+effective fields so fixed-size quantum proposals can be embedded in a larger
+lattice.
 
 Default geometry:
 
@@ -11,12 +13,13 @@ Default geometry:
 * one 120-qubit half-sweep circuit for each checkerboard color, with same-color
   blocks placed on disjoint qubits and therefore executable in parallel.
 
-Quantum proposal:
+The Trotterized block proposal uses the endpoint-cancelled product formula
 
     V_tilde = exp(-i H1 dt) [exp(-i H2 dt) exp(-i H1 dt)] ** (r - 1)
 
-The randomized schedule follows Layden's hardware-style grid: gamma in
-[0.25, 0.6], integer r in [2, 25], and t = r * 0.8.
+The randomized schedule follows Layden's experimental Trotter-circuit grid:
+gamma in [0.25, 0.6] with 10 midpoint values, and total time
+t = r * 0.8 for integer r in [2, 25].
 
 Checkerboard substitution:
 
@@ -27,9 +30,10 @@ Layden proposal is built.  The global model uses the local codebase convention
 E(s) = s.T J s + s.T h, so the circuit angles are translated to make the
 proposal Hamiltonian diagonal match this sign convention.
 
-The command-line debug path simulates each block with a 15-qubit Statevector.
-The 120-qubit circuit builders remain available for inspecting the full
-checkerboard half-sweep circuit.
+The sampler path uses exact 15-qubit statevector probabilities and draws one
+proposal sample from that distribution.  No finite-shot backend execution is
+used here.  The 120-qubit circuit builders remain available for inspecting the
+full checkerboard half-sweep circuits.
 """
 
 from __future__ import annotations
@@ -42,6 +46,10 @@ import sys
 from typing import Iterable
 
 import numpy as np
+
+
+DISPLAY_RNG_OFFSET = 104729
+REPORT_SEPARATOR = "=" * 88
 
 
 # =============================================================================
@@ -99,7 +107,12 @@ class TrotterSpec:
 
 @dataclass(frozen=True)
 class ParameterSchedule:
-    """Randomized grid from which block-level Trotter settings are sampled."""
+    """Randomized grid from which block-level Trotter settings are sampled.
+
+    This is the experimental Trotter-circuit setting in Layden Eq. S17/S18:
+    10 gamma midpoints on [0.25, 0.6], delta_t = 0.8, and integer r in
+    [2, 25], giving t in {1.6, 2.4, ..., 20}.
+    """
 
     gamma_min: float = 0.25
     gamma_max: float = 0.6
@@ -209,6 +222,8 @@ def validate_lattice_spec(spec: LatticeSpec) -> None:
 
 
 def lattice_index(row: int, col: int, cols: int) -> int:
+    """Map a row/column coordinate to a flat lattice index."""
+
     return row * cols + col
 
 
@@ -361,7 +376,10 @@ def layden_gamma_grid(schedule: ParameterSchedule) -> np.ndarray:
     """Midpoint grid used in Layden's hardware Trotter implementation."""
     step = (schedule.gamma_max - schedule.gamma_min) / schedule.gamma_grid_size
     return np.array(
-        [schedule.gamma_min + (index + 0.5) * step for index in range(schedule.gamma_grid_size)],
+        [
+            schedule.gamma_min + (index + 0.5) * step
+            for index in range(schedule.gamma_grid_size)
+        ],
         dtype=float,
     )
 
@@ -436,7 +454,12 @@ def normalize_angle(angle: float) -> float:
     return float((angle + np.pi) % (2.0 * np.pi) - np.pi)
 
 
-def xz_rotation_to_u_parameters(a: float, b: float, *, eps: float = 1e-12) -> tuple[float, float, float]:
+def xz_rotation_to_u_parameters(
+    a: float,
+    b: float,
+    *,
+    eps: float = 1e-12,
+) -> tuple[float, float, float]:
     r"""Return Qiskit U(theta, phi, lambda) parameters for exp[-i(a X + b Z)].
 
     Qiskit's U gate matches this single-qubit unitary up to a global phase,
@@ -473,7 +496,11 @@ def xz_rotation_to_u_parameters(a: float, b: float, *, eps: float = 1e-12) -> tu
     return float(theta), normalize_angle(phi), normalize_angle(lam)
 
 
-def nonzero_upper_couplings(J_matrix: np.ndarray, *, tol: float = 1e-12) -> Iterable[tuple[int, int, float]]:
+def nonzero_upper_couplings(
+    J_matrix: np.ndarray,
+    *,
+    tol: float = 1e-12,
+) -> Iterable[tuple[int, int, float]]:
     """Yield nonzero upper-triangular ZZ couplings."""
 
     q = J_matrix.shape[0]
@@ -643,7 +670,11 @@ def append_h2_step(qc, plans: list[BlockPlan], *, local: bool) -> None:
     """Append one ZZ-coupling H2 step, layered over disjoint RZZ gates."""
 
     max_layers = max((len(plan.rzz_layers) for plan in plans), default=0)
-    qubits = list(range(plans[0].effective_problem.n)) if local and plans else active_qubits(plans)
+    qubits = (
+        list(range(plans[0].effective_problem.n))
+        if local and plans
+        else active_qubits(plans)
+    )
 
     for layer_index in range(max_layers):
         for plan in plans:
@@ -676,7 +707,11 @@ def build_block_circuit(
         raise ValueError("trotter_steps must be at least 1.")
     QuantumCircuit = import_qiskit()
     q = plan.effective_problem.n
-    qc = QuantumCircuit(q, q if include_measurements else 0, name=f"{plan.color}_{plan.color_index}")
+    qc = QuantumCircuit(
+        q,
+        q if include_measurements else 0,
+        name=f"{plan.color}_{plan.color_index}",
+    )
 
     prepare_block_qubits(qc, plan, local=True)
     barrier_on(qc, list(range(q)))
@@ -719,7 +754,11 @@ def build_phase_circuit(
         trotter_specs=trotter_specs,
     )
     phase_qubits = active_qubits(plans)
-    qc = QuantumCircuit(problem.n, problem.n if include_measurements else 0, name=f"{color}_phase")
+    qc = QuantumCircuit(
+        problem.n,
+        problem.n if include_measurements else 0,
+        name=f"{color}_phase",
+    )
 
     for plan in plans:
         prepare_block_qubits(qc, plan, local=False)
@@ -750,7 +789,11 @@ def build_phase_circuit(
 
 def basis_index_to_spins_little_endian(index: int, n: int) -> np.ndarray:
     """Convert a Qiskit basis index to spins ordered by qubit index."""
-    return np.array([1 if ((index >> qubit) & 1) == 0 else -1 for qubit in range(n)], dtype=int)
+
+    return np.array(
+        [1 if ((index >> qubit) & 1) == 0 else -1 for qubit in range(n)],
+        dtype=int,
+    )
 
 
 def sample_block_output_statevector(
@@ -888,11 +931,17 @@ def format_vector(values: np.ndarray) -> str:
     return "[" + ", ".join(f"{float(value): .6g}" for value in values) + "]"
 
 
-def print_block_report(plan: BlockPlan, circuit, *, fold: int, draw_circuit: bool = True) -> None:
+def print_block_report(
+    plan: BlockPlan,
+    circuit,
+    *,
+    fold: int,
+    draw_circuit: bool = True,
+) -> None:
     """Print the block-level effective fields, gate parameters, and circuit."""
 
     eff = plan.effective_problem
-    print("=" * 88)
+    print(REPORT_SEPARATOR)
     print(f"{plan.color.upper()} block {plan.color_index}")
     print(
         "proposal parameters: "
@@ -902,14 +951,20 @@ def print_block_report(plan: BlockPlan, circuit, *, fold: int, draw_circuit: boo
         f"t={plan.trotter.total_time:.8g}"
     )
     print(f"global spin indices: {plan.global_indices.tolist()}")
-    print(f"current block spins: {plan.current_spins.tolist()}  (+1 -> |0>, -1 -> |1>)")
+    print(
+        f"current block spins: {plan.current_spins.tolist()}  "
+        "(+1 -> |0>, -1 -> |1>)"
+    )
     print(f"alpha: {eff.alpha:.12g}")
     print(f"h_eff: {format_vector(eff.h_eff)}")
     print(f"h_quantum: {format_vector(eff.h_quantum)}")
     print(f"internal ZZ couplings: {sum(len(layer) for layer in plan.rzz_layers)}")
-    print(f"RZZ parallel layers per H2 step: {len(plan.rzz_layers)}")
+    print(f"RZZ entangling layers per H2 step: {len(plan.rzz_layers)}")
 
-    print("\nH1 gates use Qiskit u(theta, phi, lambda) for exp[-i(a X + b Z)]:")
+    print(
+        "\nH1 gates use Qiskit u(theta, phi, lambda) "
+        "for exp[-i(a X + b Z)]:"
+    )
     for term in plan.one_qubit_terms:
         print(
             f"  q[{term.local_qubit:>2}] global={term.global_qubit:>3} "
@@ -987,7 +1042,7 @@ def main() -> None:
         seed=args.seed,
         temperature=args.temperature,
     )
-    display_rng = np.random.default_rng(args.seed + 104729)
+    display_rng = np.random.default_rng(args.seed + DISPLAY_RNG_OFFSET)
     black_blocks, white_blocks = get_rectangular_checkerboard_blocks(spec)
     validate_same_color_independence(problem, black_blocks)
     validate_same_color_independence(problem, white_blocks)
@@ -1000,7 +1055,7 @@ def main() -> None:
     print(f"initial state fingerprint: {fingerprint_array(initial_state)}")
     print(f"initial energy: {problem.energy(initial_state): .8g}")
     print(
-        "Layden S16 settings: randomized per block, "
+        "Layden experimental Trotter settings: randomized per block, "
         f"gamma midpoint grid in [{schedule.gamma_min:g}, {schedule.gamma_max:g}] "
         f"with {schedule.gamma_grid_size} points, "
         f"r in [{schedule.r_min}, {schedule.r_max}], "
@@ -1037,7 +1092,7 @@ def main() -> None:
         trotter_specs=black_trotter_specs,
         include_measurements=True,
     )
-    print("=" * 88)
+    print(REPORT_SEPARATOR)
     print("120-qubit black half-sweep circuit")
     print(f"active qubits: {len(active_qubits(black_plans))}")
     print(f"operation counts: {dict(black_phase_circuit.count_ops())}")
@@ -1055,8 +1110,11 @@ def main() -> None:
         sweeps=args.sweeps,
         rng=rng,
     )
-    print("=" * 88)
-    print(f"Checkerboard simulation ({args.sweeps} sweep(s), Layden-randomized parameters)")
+    print(REPORT_SEPARATOR)
+    print(
+        f"Checkerboard simulation "
+        f"({args.sweeps} sweep(s), Layden-randomized parameters)"
+    )
     for item in history:
         rejected = item.total_blocks - item.accepted_blocks - item.self_proposals
         if item.accepted_moves:
