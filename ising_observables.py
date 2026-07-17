@@ -36,7 +36,7 @@ import shutil
 
 import numpy as np
 
-from qiskit_checkerboard_circuits import (
+from checkerboard import (
     IsingProblem,
     LatticeSpec,
     ParameterSchedule,
